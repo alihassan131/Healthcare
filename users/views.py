@@ -1,16 +1,15 @@
-from rest_framework import serializers, status, viewsets
-from .models import Doctor, Patient,MonitoringSession
-from .serializers import DoctorSerializer, PatientSerializer,MonitoringSessionSerializer
-from rest_framework.permissions import IsAuthenticated
-from .permissions import IsAdmin, IsAdminOrDoctor, IsAdminOrSelfDoctor
 from datetime import datetime
-from django.db.models import Count, Sum
 from django.conf import settings
+from django.db.models import Count, Sum
 from django.utils import timezone
-from rest_framework.response import Response
+from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
-
+from .models import Doctor, MonitoringSession, Patient
+from .permissions import IsAdmin, IsAdminOrDoctor, IsAdminOrSelfDoctor
+from .serializers import DoctorSerializer, MonitoringSessionSerializer, PatientSerializer
 
 
 def is_admin(user):
@@ -26,14 +25,12 @@ class DoctorViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated()]
         if self.action in ('update', 'partial_update'):
             return [IsAuthenticated(), IsAdminOrSelfDoctor()]
-        return [IsAdmin()] 
-    
-    
+        return [IsAdmin()]
 
 
 class PatientViewSet(viewsets.ModelViewSet):
     serializer_class = PatientSerializer
-    
+
     def get_queryset(self):
         user = self.request.user
         qs = Patient.objects.select_related('user', 'doctor', 'hospital', 'location')
@@ -45,7 +42,6 @@ class PatientViewSet(viewsets.ModelViewSet):
         if user.role == 'patient':
             return qs.filter(user=user)
         return qs.none()
-
 
     def get_permissions(self):
         if self.action in ('list', 'retrieve'):
@@ -59,10 +55,10 @@ class PatientViewSet(viewsets.ModelViewSet):
         if not is_admin(user) and user.role == 'doctor':
             serializer.save(doctor=user.doctor_profile)
         else:
-            serializer.save()      
+            serializer.save()
+
 
 def month_range(month_str):
-
     if month_str:
         year, month = map(int, month_str.split("-"))
     else:
@@ -113,101 +109,117 @@ class MonitoringSessionViewSet(viewsets.ModelViewSet):
         user = request.user
         program = request.query_params.get("program")
         patient_id = request.query_params.get("patient")
+        month = request.query_params.get("month")
+
+        if program and program not in ["RPM", "CCM"]:
+            return Response(
+                {"error": "Program must be RPM or CCM."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if patient_id and not patient_id.isdigit():
-            return Response({"detail": "patient must be a number"},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Patient ID must be a valid number."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
-            start, end = month_range(request.query_params.get("month"))
-        except ValueError:
-            return Response({"detail": "month must look like 2026-10"},
-                            status=status.HTTP_400_BAD_REQUEST)
+            start, end = month_range(month)
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Invalid month format. Use YYYY-MM."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        programs = [program] if program in ("RPM", "CCM") else ["RPM", "CCM"]
-        results = []
+        programs = [program] if program else ["RPM", "CCM"]
+        patients = Patient.objects.all()
 
-        
-        ccm_target = settings.MONITORING_TARGET_MINUTES["CCM"]
-        ccm_totals = {
-            r["patient_id"]: r
-            for r in MonitoringSession.objects.filter(
-                program="CCM", start_time__gte=start, start_time__lt=end,
-            ).values("patient_id").annotate(total=Sum("duration_minutes"), count=Count("id"))
-        }
+        if user.is_superuser or user.is_staff:
+            pass
+        elif user.role == "doctor":
+            patients = patients.filter(doctor__user=user)
+        elif user.role == "patient":
+            patients = patients.filter(user=user)
+        else:
+            return Response(
+                {"error": "You do not have permission."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if patient_id:
+            patients = patients.filter(id=patient_id)
+
+        # Response data structure ko dictionary block mein convert kiya taake keys bilkul saaf alag hon
+        segmented_results = {"RPM": [], "CCM": []}
 
         for prog in programs:
             target = settings.MONITORING_TARGET_MINUTES[prog]
             flag = MonitoringSession.PROGRAM_FIELD[prog]
-
-            
-            patients = Patient.objects.select_related("user").filter(**{flag: True})
-            if is_admin(user):
-                pass
-            elif user.role == "doctor":
-                patients = patients.filter(doctor__user=user)
-            elif user.role == "patient":
-                patients = patients.filter(user=user)
-            else:
-                patients = patients.none()
-            if patient_id:
-                patients = patients.filter(id=patient_id)
+            enrolled_patients = patients.filter(**{flag: True})
 
             sessions = MonitoringSession.objects.filter(
-                program=prog, start_time__gte=start, start_time__lt=end,
-                patient__in=patients,
+                program=prog,
+                start_time__gte=start,
+                start_time__lt=end,
+                patient__in=enrolled_patients
             )
 
             totals = {
-                r["patient_id"]: r
-                for r in sessions.values("patient_id")
-                .annotate(total=Sum("duration_minutes"), count=Count("id"))
+                row["patient_id"]: row
+                for row in sessions.values("patient_id").annotate(
+                    total=Sum("duration_minutes"),
+                    count=Count("id")
+                )
             }
 
-            per_doctor = {}
-            rows = (sessions
-                    .values("patient_id", "doctor_id", "doctor__user__username")
-                    .annotate(minutes=Sum("duration_minutes")))
-            for r in rows:
-                per_doctor.setdefault(r["patient_id"], []).append({
-                    "doctor_id": r["doctor_id"],
-                    "doctor": r["doctor__user__username"],
-                    "minutes": r["minutes"],
+            doctor_totals = (
+                sessions.values(
+                    "patient_id",
+                    "doctor_id",
+                    "doctor__user__first_name",
+                    "doctor__user__last_name"
+                )
+                .annotate(total=Sum("duration_minutes"))
+            )
+
+            doctors_by_patient = {}
+
+            for row in doctor_totals:
+                pid = row["patient_id"]
+                if pid not in doctors_by_patient:
+                    doctors_by_patient[pid] = []
+
+                doctors_by_patient[pid].append({
+                    "doctor_id": row["doctor_id"],
+                    "doctor_name": (
+                        f'{row["doctor__user__first_name"]} '
+                        f'{row["doctor__user__last_name"]}'
+                    ).strip(),
+                    "minutes": row["total"] or 0
                 })
 
-            for p in patients:
-                row = totals.get(p.id, {})
-                total = row.get("total") or 0
+            for patient in enrolled_patients:
+                data = totals.get(patient.id, {})
+                total_minutes = data.get("total") or 0
+                session_count = data.get("count", 0)
+                remaining_minutes = max(target - total_minutes, 0)
+                compliant = total_minutes >= target
+
                 item = {
-                    "patient_id": p.id,
-                    "patient": p.user.get_full_name() or p.user.username,
-                    "program": prog,
-                    "month": start.strftime("%Y-%m"),
-                    "total_minutes": total,
+                    "patient_id": patient.id,
+                    "patient_name": str(patient),
+                    "total_minutes": total_minutes,
                     "target_minutes": target,
-                    "remaining_minutes": max(target - total, 0),
-                    "compliant": total >= target,
-                    "sessions": row.get("count", 0),
-                    "doctors": per_doctor.get(p.id, []),
+                    "remaining_minutes": remaining_minutes,
+                    "compliant": compliant,
+                    "session_count": session_count,
+                    "doctors": doctors_by_patient.get(patient.id, [])
                 }
+                segmented_results[prog].append(item)
 
-                
-                if prog == "RPM" and item["compliant"]:
-                    c = ccm_totals.get(p.id, {})
-                    own = c.get("total") or 0
-                    extra = max(total - target, 0) 
-                    c_total = own + extra
-                    item["ccm"] = {
-                        "enrolled": p.is_ccm,
-                        "own_minutes": own,                   
-                        "carried_over_from_rpm": extra,       
-                        "total_minutes": c_total,
-                        "target_minutes": ccm_target,
-                        "remaining_minutes": max(ccm_target - c_total, 0),
-                        "compliant": c_total >= ccm_target,
-                        "sessions": c.get("count", 0),
-                    }
-
-                results.append(item)
-
-        return Response(results)
+        return Response({
+            "month": month,
+            "start_date": start,
+            "end_date": end,
+            "results": segmented_results
+        })
