@@ -52,7 +52,7 @@ class PatientViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
-        if not is_admin(user) and user.role == 'Patient':
+        if not is_admin(user) and user == 'Patient':
             serializer.save(doctor=user.doctor_profile)
         else:
             serializer.save()
